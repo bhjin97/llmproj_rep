@@ -16,6 +16,7 @@ import plotly.express as px
 from PIL import Image
 import io
 import base64, html
+import json
 
 def load_avatar(path):
     img = Image.open(path)
@@ -83,6 +84,9 @@ def render_bubble(role: str, text: str, avatar_bytes: bytes = None):
         '''
     st.markdown(html_block, unsafe_allow_html=True)
 
+# 페이지 기본 설정
+st.set_page_config(page_title="츄러스미 심리케어",layout='wide')
+
 # ✅ 세션 상태 초기화 (맨 위에서 딱 한 번만 실행)
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -130,15 +134,73 @@ def ask_gpt(user_id, user_input, emotion=None):
     return response.choices[0].message.content
 
 # ========== 감정 분석 ==========
-def analyze_emotion(user_input):
-    response = client.chat.completions.create(
+# 분포까지 계산
+def analyze_emotion_distribution(user_input: str):
+    """
+    반환 예:
+    {
+      "joy": 0.12, "sadness": 0.55, "anger": 0.06, "hurt": 0.10, "embarrassed": 0.07, "anxiety": 0.10,
+      "dominant_emotion": "슬픔"
+    }
+    """
+    system = (
+        "다음 한국어 문장의 감정 분포를 JSON으로만 출력해.\n"
+        "labels = [기쁨(joy), 슬픔(sadness), 분노(anger), 상처(hurt), 당황(embarrassed), 불안(anxiety)].\n"
+        "요구 형식: {\"joy\":0~1, \"sadness\":0~1, \"anger\":0~1, \"hurt\":0~1, \"embarrassed\":0~1, \"anxiety\":0~1, \"dominant_emotion\":\"라벨\"}\n"
+        "합계는 1.0에 가깝게. dominant_emotion은 가장 높은 감정의 한국어 라벨(기쁨/슬픔/분노/상처/당황/불안)만."
+    )
+    resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "다음 문장의 감정을 기쁨 슬픔 당황 분노 상처 중 하나의 단어로만 출력해."},
+            {"role": "system", "content": system},
             {"role": "user", "content": user_input}
-        ]
+        ],
+        temperature=0.3
     )
-    return response.choices[0].message.content.strip()
+    txt = resp.choices[0].message.content.strip()
+
+    # JSON 파싱 & 방어로직
+    try:
+        data = json.loads(txt)
+    except Exception:
+        # 파싱 실패 시 간단 분류로 폴백
+        data = {}
+
+    # 키 보정 & 기본값
+    keys = ["joy","sadness","anger","hurt","embarrassed","anxiety"]
+    for k in keys:
+        data[k] = float(data.get(k, 0))
+
+    # 정규화(합 0이면 그대로 0, 아니면 1.0로 맞춤)
+    s = sum(data[k] for k in keys)
+    if s > 0:
+        for k in keys:
+            data[k] = round(data[k] / s, 3)
+
+    # dominant_emotion 보정
+    ko_map = {
+        "joy":"기쁨", "sadness":"슬픔", "anger":"분노",
+        "hurt":"상처", "embarrassed":"당황", "anxiety":"불안"
+    }
+    if not data.get("dominant_emotion"):
+        # 스코어 최대값으로 결정
+        top = max(keys, key=lambda k: data[k])
+        data["dominant_emotion"] = ko_map[top]
+    else:
+        # 혹시 영문 키면 한국어로 치환
+        de = data["dominant_emotion"]
+        inv = {v:k for k,v in ko_map.items()}
+        if de in inv:
+            top = inv[de]
+        else:
+            top = max(keys, key=lambda k: data[k])
+            data["dominant_emotion"] = ko_map[top]
+
+    return data
+
+# 이전 코드와 호환: 지배감정만 필요할 때
+def analyze_emotion(user_input: str) -> str:
+    return analyze_emotion_distribution(user_input)["dominant_emotion"]
 
 # ========== DB 저장 ==========
 def save_chat_and_emotion(user_id, question, answer):
@@ -147,26 +209,35 @@ def save_chat_and_emotion(user_id, question, answer):
     chat_date = datetime.now().date()
     chat_time = datetime.now().time()
 
-    # UserChat 저장
+    # 1) UserChat 저장
     cursor.execute("""
         INSERT INTO UserChat (user_id, chat_date, chat_time, question, answer)
         VALUES (%s, %s, %s, %s, %s)
     """, (user_id, chat_date, chat_time, question, answer))
-    chat_id = cursor.lastrowid   # 방금 저장된 chat_id 가져오기
+    chat_id = cursor.lastrowid
 
-    # 감정 분석
-    dominant_emotion = analyze_emotion(question)
+    # 2) 감정 분포 분석
+    dist = analyze_emotion_distribution(question)
 
-    # EmotionLog 저장
+    # 3) EmotionLog 저장 (점수 + 지배감정)
+    #    - 점수 컬럼이 실제로 있는 경우에만 값을 넣도록 구성
     cursor.execute("""
-        INSERT INTO EmotionLog (chat_id, user_id, dominant_emotion)
-        VALUES (%s, %s, %s)
-    """, (chat_id, user_id, dominant_emotion))
+        INSERT INTO EmotionLog
+            (chat_id, user_id, joy_score, sadness_score, anger_score, hurt_score, embarrassed_score, anxiety_score, dominant_emotion)
+        VALUES
+            (%s, %s, %s,  %s, %s, %s, %s, %s, %s)
+    """, (
+        chat_id, user_id,
+        dist["joy"], dist["sadness"], dist["anger"], dist["hurt"], dist["embarrassed"], dist["anxiety"],
+        dist["dominant_emotion"]
+    ))
 
     conn.commit()
     cursor.close()
     conn.close()
-    return dominant_emotion
+
+    return dist["dominant_emotion"]  # 기존 사용처와 호환
+
 
 # ========== DB 불러오기 ==========
 def load_chats(user_id):
@@ -365,75 +436,290 @@ if "logged_in" not in st.session_state:
     st.session_state.user_id = None  
     
 def my_dashboard():
-    user_id = st.session_state["user_id"]
-    st.subheader(f"{st.session_state.username}님의 심리 대시보드 💉")
+    # 안전하게 기본값
+    username = st.session_state.get("username", "")
+    user_id = st.session_state.get("user_id")
+    st.subheader(f"{username}님의 심리 대시보드 💉")
+
+    if not user_id:
+        st.warning("로그인이 필요합니다.")
+        return
 
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
 
-    # 1️⃣ 날짜별 감정 로그 불러오기 (dominant_emotion만 활용)
+    # 0) 날짜/점수용 기반 데이터: 날짜별 우울점수(가중합) 계산
+    #    우울점수 = anxiety*0.4 + hurt*0.3 + sadness*0.3  (0~1 범위라면 100배해서 보이게)
     cursor.execute("""
-        SELECT uc.chat_date, el.dominant_emotion, COUNT(*) as cnt
+        SELECT uc.chat_date,
+               AVG(COALESCE(el.anxiety_score,0)*0.4 + 
+                   COALESCE(el.hurt_score,0)*0.3 + 
+                   COALESCE(el.sadness_score,0)*0.3) AS depression_raw
         FROM EmotionLog el
         JOIN UserChat uc ON el.chat_id = uc.chat_id
-        WHERE el.user_id=%s
-        GROUP BY uc.chat_date, el.dominant_emotion
-        ORDER BY uc.chat_date ASC
+        WHERE el.user_id = %s
+        GROUP BY uc.chat_date
+        ORDER BY uc.chat_date
     """, (user_id,))
-    logs = cursor.fetchall()
-    df_psych = pd.DataFrame(logs)
+    rows = cursor.fetchall()
 
-    # 2️⃣ 우울 점수 계산 (불안40% + 상처30% + 슬픔30%)
-    today_depression, max_depression = None, None
+    # -------------------------------------------
+    # ① 우울점수 집계용 DataFrame 구성
+    # -------------------------------------------
+    df_psych = pd.DataFrame(rows, columns=["chat_date", "depression_raw"]) if rows else \
+            pd.DataFrame(columns=["chat_date", "depression_raw"])
+
     if not df_psych.empty:
-        pivot = df_psych.pivot(index="chat_date", columns="dominant_emotion", values="cnt").fillna(0)
-        # 가중치 적용
-        weights = {"불안": 0.4, "상처": 0.3, "슬픔": 0.3}
-        pivot["depression_score"] = (
-            pivot.get("불안", 0)*weights["불안"] +
-            pivot.get("상처", 0)*weights["상처"] +
-            pivot.get("슬픔", 0)*weights["슬픔"]
-        )
-        today_depression = round(pivot.iloc[-1]["depression_score"], 1)  # 가장 최근 날짜
-        max_depression = round(pivot["depression_score"].max(), 1)
+        # 날짜/점수 보정
+        df_psych["chat_date"] = pd.to_datetime(df_psych["chat_date"], errors="coerce")
+        df_psych["depression_raw"] = pd.to_numeric(df_psych["depression_raw"], errors="coerce").fillna(0.0)
+        df_psych["우울점수"] = (df_psych["depression_raw"] * 100).round(1)
 
-    # 3️⃣ KPI 카드
-    col1, col2, col3 = st.columns(3)
+        # 최종적으로 '날짜' 컬럼으로 사용
+        df_psych = df_psych.rename(columns={"chat_date": "날짜"})
+
+        # 오늘 값 / 최고값
+        today_mask = df_psych["날짜"].dt.date == datetime.now().date()
+        today_depression = float(df_psych.loc[today_mask, "우울점수"].iloc[-1]) if today_mask.any() else None
+        max_depression = float(df_psych["우울점수"].max())
+    else:
+        today_depression = None
+        max_depression = None
+
+    # -------------------------------------------
+    # ② "오늘 사용시간" 추정 (UserChat의 first/last time 기준)
+    # -------------------------------------------
+    cursor.execute("""
+        SELECT MIN(chat_time) AS first_time, MAX(chat_time) AS last_time
+        FROM UserChat
+        WHERE user_id = %s AND chat_date = CURRENT_DATE()
+    """, (user_id,))
+    today_session = cursor.fetchone()
+
+    def _to_time(v):
+        # v가 timedelta면 00:00 기준으로 변환, datetime이면 time() 추출, time이면 그대로 반환
+        if v is None:
+            return None
+        from datetime import timedelta
+        if isinstance(v, timedelta):
+            return (datetime.min + v).time()
+        if hasattr(v, "time"):
+            # datetime.datetime인 경우
+            try:
+                return v.time()
+            except Exception:
+                pass
+        return v  # 이미 time이거나 파서 불필요한 타입은 그대로
+
+    ft = _to_time(today_session["first_time"]) if today_session else None
+    lt = _to_time(today_session["last_time"]) if today_session else None
+
+    if ft and lt:
+        t1 = datetime.combine(datetime.today().date(), ft)
+        t2 = datetime.combine(datetime.today().date(), lt)
+        usage_minutes = max(0, int((t2 - t1).total_seconds() // 60))
+    else:
+        usage_minutes = 0
+
+    total_usage_hour = usage_minutes // 60
+    total_usage_min = usage_minutes % 60
+
+
+    # 2) 상단 KPI + 날짜 선택
+    col1, col2, col3, col4 = st.columns([2,1,1,1])
+
+    # 날짜 범위 계산 (df_psych가 비었을 때 대비)
+    if not df_psych.empty:
+        date_series = pd.to_datetime(df_psych["날짜"], errors="coerce").dropna()
+        login_date_min = date_series.min().date()
+        login_date_default = date_series.max().date()
+    else:
+        login_date_min = login_date_default = datetime.now().date()
+
     with col1:
-        st.metric("오늘 우울 점수", f"😔 {today_depression if today_depression else '-'}")
+        st.markdown("**📅 로그인 날짜 선택**")
+        # ✅ 항상 생성되도록 위치 이동 + 컬럼 안에서 렌더
+        login_date = st.date_input(
+            "📅 로그인 날짜",
+            value=login_date_default,
+            min_value=login_date_min,
+            max_value=login_date_default
+        )
+
     with col2:
-        st.metric("최근 최고 우울 점수", f"📈 {max_depression if max_depression else '-'}")
+        st.metric(label="오늘 사용 시간", value=f"{total_usage_hour}시간 {total_usage_min}분", delta="+0분")
     with col3:
-        st.metric("총 기록된 일수", f"{df_psych['chat_date'].nunique() if not df_psych.empty else 0}일")
+        st.metric(label="오늘 우울 점수", value=(f"😔 {today_depression:.1f}" if today_depression is not None else "—"))
+    with col4:
+        st.metric(label="최근 최고 우울 점수", value=(f"📈 {max_depression:.1f}" if max_depression is not None else "—"))
 
     st.divider()
 
-    # 4️⃣ 감정 상태 분석 (Radar Chart: dominant_emotion 비율)
-    if not df_psych.empty:
-        last_day = df_psych["chat_date"].max()
-        daily = df_psych[df_psych["chat_date"] == last_day]
-        emo_counts = daily.set_index("dominant_emotion")["cnt"].to_dict()
+    # 3) 좌측 탭들: 기본정보/히스토리/요약/행동
+    colL, colM, colR = st.columns([1,1,1])
 
-        emotions = ["기쁨","슬픔","분노","상처","당황","불안"]
-        values = [emo_counts.get(e, 0) for e in emotions]
+    with colL:
+        tabs = st.tabs(["기본 정보", "상담 히스토리", "최근 상담 요약", "추천 행동"])
 
-        fig_radar = go.Figure()
-        fig_radar.add_trace(go.Scatterpolar(r=values+[values[0]], theta=emotions+[emotions[0]], fill="toself"))
-        fig_radar.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, max(values)+1])),
-                                showlegend=False, height=300)
-        st.plotly_chart(fig_radar, use_container_width=True)
-    else:
-        st.info("아직 감정 데이터가 없습니다.")
+        # 기본 정보
+        with tabs[0]:
+            cursor.execute("SELECT name, gender, age, address FROM Member WHERE user_id=%s", (user_id,))
+            member = cursor.fetchone() or {"name":"-", "gender":"-", "age":"-", "address":"-"}
+            st.markdown("**📝 기본 정보**")
+            st.markdown(f"- 이름: {member.get('name','-')}")
+            st.markdown(f"- 성별: {member.get('gender','-')}")
+            st.markdown(f"- 나이: {member.get('age','-')}")
+            st.markdown(f"- 주소: {member.get('address','-')}")
 
-    # 5️⃣ 우울 점수 추이 (Line Chart)
-    if not df_psych.empty:
-        fig_line = go.Figure()
-        fig_line.add_trace(go.Scatter(x=pivot.index, y=pivot["depression_score"],
-                                      mode="lines+markers", line=dict(shape="spline")))
-        fig_line.update_layout(yaxis_range=[0, pivot["depression_score"].max()+1], height=300)
-        st.plotly_chart(fig_line, use_container_width=True)
-    else:
-        st.info("아직 우울 점수 데이터 없음")
+        # 상담 히스토리 (최근 5개)
+        with tabs[1]:
+            st.markdown("**📁 상담 히스토리**")
+            cursor.execute("""
+                SELECT chat_date, question 
+                FROM userchat 
+                WHERE user_id=%s 
+                ORDER BY chat_id DESC 
+                LIMIT 5
+            """, (user_id,))
+            history = cursor.fetchall()
+            if history:
+                for h in history:
+                    st.write(f"- {h['chat_date']} 👉 {h['question'][:60]}{'...' if len(h['question'])>60 else ''}")
+            else:
+                st.info("히스토리가 없습니다.")
+
+        # 최근 상담 요약 (가장 최신 1개)
+        with tabs[2]:
+            st.markdown("**🌧️ 최근 상담 요약**")
+            cursor.execute("""
+                SELECT cs.summary_text
+                FROM CounselingSummary AS cs
+                JOIN UserChat          AS uc ON cs.chat_id = uc.chat_id
+                WHERE uc.user_id = %s
+                ORDER BY cs.summary_id DESC
+                LIMIT 1
+            """, (user_id,))
+            summary = cursor.fetchone()
+            if summary and summary.get("summary_text"):
+                st.info(summary["summary_text"])
+            else:
+                st.write("요약 데이터가 없습니다.")
+
+        # 추천 행동 (정적 문구)
+        with tabs[3]:
+            st.markdown("**💡 추천 행동**")
+            st.markdown("""
+            - 하루 5분 감정 기록하기 (글로 적으면 감정 정리에 도움)
+            - 주 30분 산책/취미 활동 (불안·무기력 완화)
+            - 가족·친구와 짧은 소통 시간 갖기 (외로움 완화)
+            - 필요 시 전문가 상담 연계
+            """)
+
+    # 4) 가운데: 선택 날짜 감정 레이더
+    with colM:
+        st.markdown("**🔯 감정상태분석**")
+        cursor.execute("""
+            SELECT 
+            AVG(COALESCE(joy_score,0))         AS joy,
+            AVG(COALESCE(sadness_score,0))     AS sadness,
+            AVG(COALESCE(anger_score,0))       AS anger,
+            AVG(COALESCE(hurt_score,0))        AS hurt,
+            AVG(COALESCE(embarrassed_score,0)) AS embarrassed,
+            AVG(COALESCE(anxiety_score,0))     AS anxiety
+            FROM EmotionLog el
+            JOIN UserChat uc ON el.chat_id = uc.chat_id
+            WHERE el.user_id=%s AND uc.chat_date=%s
+        """, (user_id, login_date))
+        emo = cursor.fetchone()
+
+        if emo and any(v for v in emo.values() if v is not None):
+            emotions_labels = ["기쁨","슬픔","분노","상처","당황","불안"]
+            values = [
+                emo["joy"] or 0, emo["sadness"] or 0, emo["anger"] or 0,
+                emo["hurt"] or 0, emo["embarrassed"] or 0, emo["anxiety"] or 0
+            ]
+            fig_radar = go.Figure()
+            fig_radar.add_trace(go.Scatterpolar(
+                r=values + [values[0]],
+                theta=emotions_labels + [emotions_labels[0]],
+                fill="toself",
+                name="감정 점수"
+            ))
+
+            # 값 스케일 (동적 범위)
+            max_val = max([float(v or 0) for v in values]) if values else 1
+            if max_val <= 1:   # 값이 0~1 사이일 때
+                y_max = min(1.0, max_val * 1.5)  # 최대값보다 살짝 크게
+            else:              # 값이 0~100 사이일 때
+                y_max = min(100.0, max_val * 1.2)
+                
+            fig_radar.update_layout(
+                polar=dict(
+                    radialaxis=dict(
+                        visible=True,
+                        range=[0, y_max],   # ✅ 유동적으로 조정된 최대치
+                        gridcolor="rgba(0,0,0,0.12)",
+                        tickfont=dict(size=12)
+                    ),
+                    angularaxis=dict(tickfont=dict(size=13))
+                ),
+                height=560,
+                margin=dict(l=30, r=30, t=20, b=20),
+                showlegend=False
+            )
+            st.plotly_chart(fig_radar, use_container_width=True)
+            
+            # 대표 감정 코멘트
+            idx_max = int(np.argmax(values)) if values else 0
+            dominant_emotion = emotions_labels[idx_max]
+            emotion_comments = {
+                "기쁨": "행복한 하루를 보내셨군요! 이 기분 오래 간직하세요 😊",
+                "슬픔": "마음이 무거운 날이었네요. 감정을 인정하는 건 용기예요 💙",
+                "불안": "불안이 느껴지네요. 천천히 숨을 쉬며 마음을 돌보세요.",
+                "분노": "화가 났던 일이 있었군요. 감정을 표현하는 건 건강한 행동이에요.",
+                "당황": "예상치 못한 일이 있었나요? 잠시 멈추고 차분히 생각해봐요.",
+                "상처": "상처받은 마음, 혼자 아파하지 마세요. 당신은 소중한 사람이에요 💖"
+            }
+            st.info(emotion_comments.get(dominant_emotion, "당신의 감정을 응원합니다 💗"))
+        else:
+            st.warning("선택한 날짜의 감정 데이터가 없습니다.")
+
+    # 5) 우측: 우울점수 변화 추이 + 북마크
+    with colR:
+        st.markdown("**📉 우울점수변화추이**")
+        if not df_psych.empty:
+            fig_line = go.Figure()
+            fig_line.add_trace(go.Scatter(
+                # ✅ 'chat_date' → '날짜' 로 통일
+                x=df_psych["날짜"],
+                y=df_psych["우울점수"],
+                mode="lines+markers",
+                line=dict(shape="spline")
+            ))
+            fig_line.update_layout(yaxis_range=[0, 100], height=220, margin=dict(l=30,r=30,t=20,b=20))
+            st.plotly_chart(fig_line, use_container_width=True)
+        else:
+            st.info("아직 우울점수 데이터가 없습니다.")
+
+        st.markdown("**📌 북마크 목록**")
+        cursor.execute("""
+            SELECT b.bookmark_id, m.title AS movie, d.title AS drama, mu.title AS music
+            FROM UserBookmark b
+            LEFT JOIN Movie m ON b.movie_id = m.movie_id
+            LEFT JOIN Drama d ON b.drama_id = d.drama_id
+            LEFT JOIN Music mu ON b.music_id = mu.music_id
+            WHERE b.user_id = %s
+            ORDER BY b.created_at DESC
+            LIMIT 5
+        """, (user_id,))
+        bookmarks = cursor.fetchall()
+        if bookmarks:
+            for bm in bookmarks:
+                if bm.get("movie"): st.write(f"🎬 영화 - {bm['movie']}")
+                if bm.get("drama"): st.write(f"📺 드라마 - {bm['drama']}")
+                if bm.get("music"): st.write(f"🎵 노래 - {bm['music']}")
+        else:
+            st.caption("북마크가 아직 없습니다.")
 
     cursor.close()
     conn.close()
