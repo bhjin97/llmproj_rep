@@ -14,9 +14,74 @@ from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
 import plotly.express as px
 from PIL import Image
+import io
+import base64, html
 
-# ai_avatar = "./data/churros.png"
-# profile = "./data/profile.jpeg"
+def load_avatar(path):
+    img = Image.open(path)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+GPT_AVATAR_PATH = load_avatar("C:/githome/llmproj_rep/data/churros.png")
+USER_AVATAR_PATH = load_avatar("C:/githome/llmproj_rep/data/profile.jpg")
+
+st.markdown("""
+<style>
+.chat-row{display:flex; gap:8px; margin:8px 0; align-items:flex-end;}
+.chat-row.user{justify-content:flex-end;}
+.chat-row.bot{justify-content:flex-start;}
+.chat-bubble{
+  max-width:70%;
+  padding:12px 16px;
+  border-radius:18px;
+  line-height:1.55;
+  font-size:16px;
+  box-shadow:0 4px 14px rgba(0,0,0,.06);
+  word-break:break-word;
+  white-space:pre-wrap;
+}
+.chat-bubble.user{background:#e8f5e9; border-top-right-radius:6px;}
+.chat-bubble.bot{background:#f5f7fb; border-top-left-radius:6px;}
+.chat-avatar{
+  width:36px; height:36px; border-radius:50%;
+  object-fit:cover;
+  box-shadow:0 2px 6px rgba(0,0,0,.12);
+}
+</style>
+""", unsafe_allow_html=True)
+
+def _bytes_to_data_uri(img_bytes: bytes) -> str:
+    return "data:image/png;base64," + base64.b64encode(img_bytes).decode()
+
+def render_bubble(role: str, text: str, avatar_bytes: bytes = None):
+    """role: 'user' or 'bot'."""
+    bubble_cls = "user" if role == "user" else "bot"
+    # 안전하게 특수문자 이스케이프
+    safe_text = html.escape(text)
+    # 간단한 이모지/줄바꿈 허용하고 싶으면 아래 라인 사용
+    # safe_text = safe_text.replace("\\n", "<br>")
+    av_html = ""
+    if avatar_bytes:
+        av_html = f'<img class="chat-avatar" src="{_bytes_to_data_uri(avatar_bytes)}" />'
+
+    if role == "user":
+        # [말풍선] [아바타]
+        html_block = f'''
+        <div class="chat-row user">
+          <div class="chat-bubble user">{safe_text}</div>
+          {av_html}
+        </div>
+        '''
+    else:
+        # [아바타] [말풍선]
+        html_block = f'''
+        <div class="chat-row bot">
+          {av_html}
+          <div class="chat-bubble bot">{safe_text}</div>
+        </div>
+        '''
+    st.markdown(html_block, unsafe_allow_html=True)
 
 # ✅ 세션 상태 초기화 (맨 위에서 딱 한 번만 실행)
 if "logged_in" not in st.session_state:
@@ -168,15 +233,15 @@ def get_dominant_emotion(user_id):
     conn.close()
     return result[0] if result else None
 
-# ========== 드라마 추천 ==========
+# 드라마 추천
 def recommend_drama_by_emotion(emotion):
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("""
-        SELECT title, description, poster_url, rating
+        SELECT drama_id, title, description, poster_url, rating
         FROM Drama
         WHERE emotion_genre = %s
-        ORDER BY rating DESC
+        ORDER BY RAND()
         LIMIT 3
     """, (emotion,))
     dramas = cursor.fetchall()
@@ -184,15 +249,15 @@ def recommend_drama_by_emotion(emotion):
     conn.close()
     return dramas
 
-# ========== 영화 추천 ==========
+# 영화 추천
 def recommend_movie_by_emotion(emotion):
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("""
-        SELECT title, description, poster_url, rating
+        SELECT movie_id, title, description, poster_url, rating
         FROM Movie
         WHERE emotion_genre = %s
-        ORDER BY rating DESC
+        ORDER BY RAND()
         LIMIT 3
     """, (emotion,))
     movies = cursor.fetchall()
@@ -200,12 +265,12 @@ def recommend_movie_by_emotion(emotion):
     conn.close()
     return movies
 
-# ========== 음악 추천 ==========
+# 음악 추천
 def recommend_music_by_emotion(emotion):
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("""
-        SELECT title, artist, album_cover
+        SELECT music_id, title, artist, album_cover
         FROM Music
         WHERE emotion_genre = %s
         LIMIT 3
@@ -215,48 +280,82 @@ def recommend_music_by_emotion(emotion):
     conn.close()
     return musics
 
+
+# ========== 추천 저장 ==========
+def save_recommendation(user_id, emotion, content_type, content_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO UserRecommendation (user_id, emotion, content_type, content_id)
+        VALUES (%s, %s, %s, %s)
+    """, (user_id, emotion, content_type, content_id))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
 # ========== 추천 출력 (3종) ==========
 def show_recommendations_all(emotion):
-    st.subheader("🎭 감정 기반 추천 결과")
+    st.subheader(f"🎭 {emotion} 감정 기반 추천 콘텐츠")
 
-    # 드라마
-    st.markdown("### 📺 드라마")
-    dramas = recommend_drama_by_emotion(emotion)
-    if dramas:
-        for d in dramas:
-            if d.get("poster_url"):
-                st.image(d["poster_url"], width=120)
-            st.markdown(f"**{d['title']}** ⭐ {d.get('rating', '')}")
-            st.caption(d.get("description", ""))
-            st.markdown("---")
-    else:
-        st.warning("해당 감정에 맞는 드라마가 없습니다 😢")
+    tabs = st.tabs(["🎬 영화", "📺 드라마", "🎵 음악" ])
 
-    # 영화
-    st.markdown("### 🎬 영화")
-    movies = recommend_movie_by_emotion(emotion)
-    if movies:
-        for m in movies:
-            if m.get("poster_url"):
-                st.image(m["poster_url"], width=120)
-            st.markdown(f"**{m['title']}** ⭐ {m.get('rating', '')}")
-            st.caption(m.get("description", ""))
-            st.markdown("---")
-    else:
-        st.warning("해당 감정에 맞는 영화가 없습니다 😢")
+    # 🎵 음악 탭
+    with tabs[2]:
+        musics = recommend_music_by_emotion(emotion)
+        if musics:
+            cols = st.columns(3)
+            for idx, mu in enumerate(musics):
+                with cols[idx % 3]:
+                    if mu.get("album_cover"):
+                        st.image(mu["album_cover"], width=120)
+                    st.markdown(f"**{mu['title']}**")
+                    st.caption(f"가수: {mu['artist']}")
+                    save_recommendation(st.session_state["user_id"], emotion, "music", mu["music_id"])
+        else:
+            st.warning("해당 감정에 맞는 음악이 없습니다 😢")
 
-    # 음악
-    st.markdown("### 🎵 음악")
-    musics = recommend_music_by_emotion(emotion)
-    if musics:
-        for mu in musics:
-            if mu.get("album_cover"):
-                st.image(mu["album_cover"], width=120)
-            st.markdown(f"**{mu['title']} - {mu['artist']}**")
-            st.markdown("---")
-    else:
-        st.warning("해당 감정에 맞는 음악이 없습니다 😢")
-        
+    # 📺 드라마 탭
+    with tabs[1]:
+        dramas = recommend_drama_by_emotion(emotion)
+        if dramas:
+            cols = st.columns(3)
+            for idx, d in enumerate(dramas):
+                with cols[idx % 3]:
+                    if d.get("poster_url"):
+                        st.image(d["poster_url"], width=120)
+                    st.markdown(f"**{d['title']}** ⭐ {d.get('rating','')}")
+
+                    # ✅ 줄거리 자르기
+                    desc = d.get("description", "")
+                    if desc and len(desc) > 100:
+                        desc = desc[:100] + "..."
+                    st.caption(desc)
+
+                    save_recommendation(st.session_state["user_id"], emotion, "drama", d["drama_id"])
+        else:
+            st.warning("해당 감정에 맞는 드라마가 없습니다 😢")
+
+    # 🎬 영화 탭
+    with tabs[0]:
+        movies = recommend_movie_by_emotion(emotion)
+        if movies:
+            cols = st.columns(3)
+            for idx, m in enumerate(movies):
+                with cols[idx % 3]:
+                    if m.get("poster_url"):
+                        st.image(m["poster_url"], width=120)
+                    st.markdown(f"**{m['title']}** ⭐ {m.get('rating','')}")
+
+                    # ✅ 줄거리 자르기
+                    desc = m.get("description", "")
+                    if desc and len(desc) > 100:
+                        desc = desc[:100] + "..."
+                    st.caption(desc)
+
+                    save_recommendation(st.session_state["user_id"], emotion, "movie", m["movie_id"])
+        else:
+            st.warning("해당 감정에 맞는 영화가 없습니다 😢")
+
 # ======================================= Dash Board ==========================================
 # 세션 상태 초기화 -------------------------------------
 if "logged_in" not in st.session_state:
@@ -339,7 +438,6 @@ def my_dashboard():
     cursor.close()
     conn.close()
 
-
 def logout():
     # 세션 상태 초기화
     st.session_state.logged_in = False
@@ -350,6 +448,152 @@ def logout():
     st.success("👋 성공적으로 로그아웃되었습니다.")
     st.rerun()  # 🔥 rerun 해서 로그인 화면으로 돌아가기
 
+def truncate_text(text, max_len=60):
+    if not text:
+        return ""
+    return text if len(text) <= max_len else text[:max_len] + "..."
+
+def render_card(rec, content_type):
+    if rec.get("cover"):
+        st.image(rec["cover"], width=120)
+
+    if content_type == "music":
+        st.markdown(f"🎵 **{rec['title']} - {rec['artist']}**")
+    else:
+        st.markdown(f"**{rec['title']}**")
+
+    # ✅ 줄거리 고정 길이 + 카드 스타일
+    st.markdown(
+        f"<div style='min-height:60px; max-height:60px; overflow:hidden; font-size:13px; color:gray;'>"
+        f"{truncate_text(rec.get('description',''), 60)}  "
+        f"(감정: {rec['emotion']})</div>",
+        unsafe_allow_html=True
+    )
+    st.markdown("---")
+
+def content():
+    st.subheader("🎬 내가 추천받은 콘텐츠 기록")
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT r.emotion, r.content_type, r.created_at,
+               COALESCE(m.title, d.title, mu.title) as title,
+               COALESCE(m.poster_url, d.poster_url, mu.album_cover) as cover,
+               COALESCE(m.description, d.description, '') as description,
+               mu.artist
+        FROM UserRecommendation r
+        LEFT JOIN Movie m ON r.content_type='movie' AND r.content_id=m.movie_id
+        LEFT JOIN Drama d ON r.content_type='drama' AND r.content_id=d.drama_id
+        LEFT JOIN Music mu ON r.content_type='music' AND r.content_id=mu.music_id
+        WHERE r.user_id=%s
+        ORDER BY r.created_at DESC
+        LIMIT 30
+    """, (st.session_state["user_id"],))
+    recs = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    if not recs:
+        st.info("아직 추천받은 콘텐츠 기록이 없습니다.")
+        return
+
+    # 👉 탭 나누기
+    tab_movie, tab_drama, tab_music = st.tabs(["🎬 영화", "📺 드라마", "🎵 음악" ])
+
+    # 🎵 음악 탭
+    with tab_music:
+        musics = [r for r in recs if r["content_type"] == "music"]
+        if musics:
+            cols = st.columns(3)
+            for idx, rec in enumerate(musics):
+                with cols[idx % 3]:
+                    if rec["cover"]:
+                        st.image(rec["cover"], width=120)
+                    st.markdown(f"**{rec['title']} - {rec['artist']}**")
+                    st.caption(f"감정: {rec['emotion']}")
+        else:
+            st.warning("추천받은 음악 기록이 없습니다.")
+
+    # 📺 드라마 탭
+    with tab_drama:
+        dramas = [r for r in recs if r["content_type"] == "drama"]
+        if dramas:
+            cols = st.columns(3)
+            for idx, rec in enumerate(dramas):
+                with cols[idx % 3]:
+                    render_card(rec, "drama")   # 카드 함수 사용
+        else:
+            st.warning("추천받은 드라마 기록이 없습니다.")
+
+
+    # 🎬 영화 탭
+    with tab_movie:
+        movies = [r for r in recs if r["content_type"] == "movie"]
+        if movies:
+            cols = st.columns(3)
+            for idx, rec in enumerate(movies):
+                with cols[idx % 3]:
+                    render_card(rec, "movie")   # 카드 함수 사용
+        else:
+            st.warning("추천받은 영화 기록이 없습니다.")
+
+def hospital():
+    st.title("🏥심린이 병원추천")
+
+    # 기본 위치: 서울 시청
+    default_lat, default_lon = 37.5665, 126.9780
+
+    # 사용자 위치 입력
+    user_location = st.text_input("📍 현재 위치를 입력하세요 (예: 서울시 강남구 역삼동)")
+
+    # 지도 초기화
+    m = folium.Map(location=[default_lat, default_lon], zoom_start=13)
+
+    # 사용자 위치 입력 시 처리
+    if user_location:
+        geolocator = Nominatim(user_agent="myGeocoder")
+        location = geolocator.geocode(user_location)
+
+        if location:
+            lat, lon = location.latitude, location.longitude
+
+            # 내 위치 마커
+            folium.Marker(
+                [lat, lon], tooltip="내 위치", icon=folium.Icon(color="blue")
+            ).add_to(m)
+
+            # 병원 예시 마커 (임의 좌표, 실제 데이터로 바꿀 수 있음)
+            folium.Marker(
+                [lat + 0.001, lon + 0.001],
+                tooltip="힐링 정신건강의학과의원",
+                icon=folium.Icon(color="green")
+            ).add_to(m)
+
+            folium.Marker(
+                [lat - 0.001, lon - 0.001],
+                tooltip="마음숲 클리닉",
+                icon=folium.Icon(color="green")
+            ).add_to(m)
+
+            # 중심을 사용자 위치로 이동
+            m.location = [lat, lon]
+            m.zoom_start = 15
+
+        else:
+            st.error("❌ 위치를 찾을 수 없습니다. 다시 입력해 주세요.")
+    else:
+        st.info("📌 위치를 입력하면 주변 병원이 지도에 표시됩니다.")
+
+        # 지도 표시
+    col1, col2, col3 = st.columns([2,1,1])
+    with col1:
+        st_folium(m, width=700, height=450)
+    with col2:
+        st.text("거리기반")
+    with col3:
+        st.text("평점기반")
+        
 def user_dashboard():
     # 사이드바 메뉴
     with st.sidebar:
@@ -368,24 +612,40 @@ def user_dashboard():
     if selected == '나의 대시보드':
         my_dashboard()
 
-    elif selected == '심린이랑 대화하기':
-        # ✅ 여기서는 네 기존 챗봇 코드 그대로 불러오기
+     # === 대화 불러오기 ===
+    elif selected == '심린이랑 대화하기':       
         chats = load_chats(st.session_state["user_id"])
         for chat in chats:
-            with st.chat_message("user"):
-                st.markdown(chat["question"])
-            with st.chat_message("assistant"):
-                st.markdown(chat["answer"])
+            render_bubble("user", chat["question"], USER_AVATAR_PATH)
+            render_bubble("bot",  chat["answer"],   GPT_AVATAR_PATH)
 
-        user_input = st.chat_input("메시지를 입력하세요")
+        # 입력창
+        user_input = st.chat_input("메시지를 입력하세요…")
         if user_input:
+            # 1) DB 저장 + GPT 호출
             answer = ask_gpt(st.session_state["user_id"], user_input)
             detected_emotion = save_chat_and_emotion(st.session_state["user_id"], user_input, answer)
-            with st.chat_message("user"):
+
+            # 2) 화면에 바로 말풍선으로 렌더
+            render_bubble("user", user_input, USER_AVATAR_PATH)
+            render_bubble("bot", answer, GPT_AVATAR_PATH)
+
+            st.rerun()
+
+        if user_input:
+            # 1) DB 저장 + GPT 호출
+            answer = ask_gpt(st.session_state["user_id"], user_input)
+            detected_emotion = save_chat_and_emotion(st.session_state["user_id"], user_input, answer)
+
+            # 2) 세션에 추가
+            with st.chat_message("user", avatar=USER_AVATAR_PATH):
                 st.markdown(user_input)
-            with st.chat_message("assistant"):
+            with st.chat_message("assistant", avatar=GPT_AVATAR_PATH):
                 st.markdown(answer)
 
+            st.rerun()
+
+        # === 추천/세션 종료 버튼 ===
         col1, col2 = st.columns(2)
         with col1:
             if st.button("추천 받기"):
@@ -403,6 +663,7 @@ def user_dashboard():
                     show_recommendations_all(dominant_emotion)
                 else:
                     st.warning("대화 기록이 없어 세션 요약을 할 수 없습니다.")
+
 
     elif selected == '심린이 추천병원':
         hospital()
