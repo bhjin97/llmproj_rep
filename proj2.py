@@ -27,6 +27,10 @@ def load_avatar(path):
 GPT_AVATAR_PATH = load_avatar("C:/githome/llmproj_rep/data/churros.png")
 USER_AVATAR_PATH = load_avatar("C:/githome/llmproj_rep/data/profile.jpg")
 
+from pathlib import Path
+CHAR_IMG_PATH = Path("C:/githome/llmproj_rep/data/image.png")  # 캐릭터 이미지
+
+
 st.markdown("""
 <style>
 .chat-row{display:flex; gap:8px; margin:8px 0; align-items:flex-end;}
@@ -972,49 +976,75 @@ st.title("💬 심리 상담 챗봇")
 if "page" not in st.session_state:
     st.session_state["page"] = "login"
 
-# 🟢 로그인 페이지
+# =========================
+# 🟢 로그인 페이지 (이미지 + 폼 나란히)
+# =========================
 if st.session_state["page"] == "login" and not st.session_state.get("user_id"):
-    st.subheader("🔑 로그인")
-    login_id = st.text_input("아이디")
-    password = st.text_input("비밀번호", type="password")
+    col_img, col_form = st.columns([1, 2], vertical_alignment="center")
 
-    if st.button("로그인"):
-        user_info = get_user_info(login_id, password)
-        if user_info:
-            st.session_state["user_id"] = user_info["user_id"]
-            st.session_state["username"] = user_info["login_id"]   # ✅ username 저장
-            st.session_state["role"] = user_info["role"]
-            st.success(f"로그인 성공! {st.session_state['username']}님 ({user_info['role']})")
-            st.rerun()
-        else:
-            st.error("아이디/비밀번호가 잘못되었습니다.")
+    with col_img:
+        try:
+            st.image(str(CHAR_IMG_PATH), width=260)  # 캐릭터 크기
+        except Exception:
+            st.markdown("<div style='font-size:100px'>🐰</div>", unsafe_allow_html=True)
 
-    if st.button("👉 회원가입"):
-        st.session_state["page"] = "register"
-        st.rerun()
+    with col_form:
+        st.markdown("### 🔑 로그인")
+        login_id = st.text_input("아이디", placeholder="아이디 입력", label_visibility="collapsed")
+        password = st.text_input("비밀번호", type="password", placeholder="비밀번호 입력", label_visibility="collapsed")
 
-# 🟢 회원가입 페이지
+        c1, c2 = st.columns([1,1])
+        with c1:
+            if st.button("로그인", use_container_width=True):
+                user_info = get_user_info(login_id, password)
+                if user_info:
+                    st.session_state["user_id"]   = user_info["user_id"]
+                    st.session_state["username"]  = user_info["login_id"]  # ✅ username 저장
+                    st.session_state["role"]      = user_info["role"]
+                    st.success(f"로그인 성공! {st.session_state['username']}님 ({user_info['role']})")
+                    st.rerun()
+                else:
+                    st.error("아이디/비밀번호가 잘못되었습니다.")
+        with c2:
+            if st.button("👉 회원가입", use_container_width=True):
+                st.session_state["page"] = "register"
+                st.rerun()
+
+# =========================
+# 🟢 회원가입 페이지 (이미지 + 폼 나란히)
+# =========================
 elif st.session_state["page"] == "register":
-    st.subheader("📝 회원가입")
+    col_img, col_form = st.columns([1, 2], vertical_alignment="center")
 
-    new_id = st.text_input("아이디")
-    new_name = st.text_input("이름")
-    new_gender = st.selectbox("성별", ["M", "F", "Other"])
-    new_age = st.number_input("나이", min_value=0, max_value=120, step=1)
-    new_address = st.text_input("주소")
-    new_pw = st.text_input("비밀번호", type="password")
+    with col_img:
+        try:
+            st.image(str(CHAR_IMG_PATH), width=220)
+        except Exception:
+            st.markdown("<div style='font-size:90px'>🐰</div>", unsafe_allow_html=True)
 
-    if st.button("가입하기"):
-        success, msg = register_user(new_id, new_name, new_gender, new_age, new_address, new_pw)
-        if success:
-            st.success(msg)
-            st.session_state["page"] = "login"
-        else:
-            st.error(msg)
+    with col_form:
+        st.markdown("### 📝 회원가입")
+        new_id     = st.text_input("아이디", placeholder="아이디", label_visibility="collapsed")
+        new_name   = st.text_input("이름", placeholder="이름", label_visibility="collapsed")
+        new_gender = st.selectbox("성별", ["M", "F", "Other"])
+        new_age    = st.number_input("나이", min_value=0, max_value=120, step=1)
+        new_address= st.text_input("주소", placeholder="주소", label_visibility="collapsed")
+        new_pw     = st.text_input("비밀번호", type="password", placeholder="비밀번호", label_visibility="collapsed")
 
-    if st.button("⬅ 돌아가기"):
-        st.session_state["page"] = "login"
-        st.rerun()
+        c1, c2 = st.columns([1,1])
+        with c1:
+            if st.button("가입하기", use_container_width=True):
+                success, msg = register_user(new_id, new_name, new_gender, new_age, new_address, new_pw)
+                if success:
+                    st.success(msg)
+                    st.session_state["page"] = "login"
+                else:
+                    st.error(msg)
+        with c2:
+            if st.button("⬅ 돌아가기", use_container_width=True):
+                st.session_state["page"] = "login"
+                st.rerun()
+
 
 # 🟢 유저 대시보드
 elif st.session_state.get("role") == "user":
